@@ -3,6 +3,7 @@
 package gormstore
 
 import (
+	"errors"
 	"flag"
 	"fmt"
 	"net/http"
@@ -12,10 +13,10 @@ import (
 	"testing"
 	"time"
 
-	_ "github.com/go-sql-driver/mysql"
-	"github.com/jinzhu/gorm"
-	_ "github.com/lib/pq"
-	_ "github.com/mattn/go-sqlite3"
+	"gorm.io/driver/mysql"
+	"gorm.io/driver/postgres"
+	"gorm.io/driver/sqlite"
+	"gorm.io/gorm"
 )
 
 // default test db
@@ -30,16 +31,33 @@ func parseCookies(value string) map[string]*http.Cookie {
 	return m
 }
 
-func connectDbURI(uri string) (*gorm.DB, error) {
+func uriToDialector(uri string) (gorm.Dialector, error) {
 	parts := strings.SplitN(uri, "://", 2)
 	driver := parts[0]
 	dsn := parts[1]
 
-	var err error
+	switch driver {
+	case "sqlite3":
+		return sqlite.Open(dsn), nil
+	case "postgres":
+		return postgres.Open(dsn), nil
+	case "mysql":
+		return mysql.Open(dsn), nil
+	}
+
+	return nil, fmt.Errorf("unknown driver %s", driver)
+}
+
+func connectDbURI(uri string) (*gorm.DB, error) {
+	dialect, err := uriToDialector(uri)
+	if err != nil {
+		return nil, err
+	}
+
 	// retry to give some time for db to be ready
 	for i := 0; i < 50; i++ {
 		var db *gorm.DB
-		db, err = gorm.Open(driver, dsn)
+		db, err = gorm.Open(dialect, &gorm.Config{})
 		if err == nil {
 			return db, nil
 		}
@@ -57,15 +75,12 @@ func newDB() *gorm.DB {
 		panic(err)
 	}
 
-	// db.LogMode(true)
+	//db = db.Debug()
 
 	// cleanup db
-	if err := db.DropTableIfExists(
-		&gormSession{tableName: "abc"},
-		&gormSession{tableName: "sessions"},
-	).Error; err != nil {
-		panic(err)
-	}
+	// TODO: check error if non not-exist err?
+	db.Migrator().DropTable("abc")
+	db.Migrator().DropTable("sessions")
 
 	return db
 }
@@ -91,8 +106,8 @@ func match(t *testing.T, resp *httptest.ResponseRecorder, code int, body string)
 }
 
 func findSession(db *gorm.DB, store *Store, id string) *gormSession {
-	s := &gormSession{tableName: store.opts.TableName}
-	if db.Where("id = ?", id).First(s).RecordNotFound() {
+	s := &gormSession{}
+	if errors.Is(store.sessionTable().Where("id = ?", id).First(s).Error, gorm.ErrRecordNotFound) {
 		return nil
 	}
 	return s
@@ -136,8 +151,9 @@ func TestExpire(t *testing.T) {
 	// test still in db but expired
 	id := r1.Header().Get("X-Session")
 	s := findSession(db, store, id)
-	s.ExpiresAt = gorm.NowFunc().Add(-40 * 24 * time.Hour)
-	db.Save(s)
+
+	s.ExpiresAt = time.Now().Add(-40 * 24 * time.Hour)
+	store.sessionTable().Save(s)
 
 	r2 := req(countFn, parseCookies(r1.Header().Get("Set-Cookie"))["session"])
 	match(t, r2, 200, "1")
@@ -220,7 +236,7 @@ func TestTableName(t *testing.T) {
 	store := NewOptions(db, Options{TableName: "abc"}, []byte("secret"))
 	countFn := makeCountHandler("session", store)
 
-	if !db.HasTable(&gormSession{tableName: store.opts.TableName}) {
+	if !db.Migrator().HasTable(store.opts.TableName) {
 		t.Error("Expected abc table created")
 	}
 
@@ -231,8 +247,8 @@ func TestTableName(t *testing.T) {
 
 	id := r2.Header().Get("X-Session")
 	s := findSession(db, store, id)
-	s.ExpiresAt = gorm.NowFunc().Add(-time.Duration(store.SessionOpts.MaxAge+1) * time.Second)
-	db.Save(s)
+	s.ExpiresAt = time.Now().Add(-time.Duration(store.SessionOpts.MaxAge+1) * time.Second)
+	store.sessionTable().Save(s)
 
 	store.Cleanup()
 
@@ -245,7 +261,7 @@ func TestSkipCreateTable(t *testing.T) {
 	db := newDB()
 	store := NewOptions(db, Options{SkipCreateTable: true}, []byte("secret"))
 
-	if db.HasTable(&gormSession{tableName: store.opts.TableName}) {
+	if db.Migrator().HasTable(store.opts.TableName) {
 		t.Error("Expected no table created")
 	}
 }
